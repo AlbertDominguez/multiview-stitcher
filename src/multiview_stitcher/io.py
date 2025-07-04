@@ -21,7 +21,7 @@ from multiview_stitcher import spatial_image_utils as si_utils
 METADATA_TRANSFORM_KEY = si_utils.DEFAULT_TRANSFORM_KEY
 
 
-def read_mosaic_into_sims(filepath, scene_index=0):
+def read_mosaic_into_sims(filepath, scene_index=0, view_index: Optional[int] = None):
     """
     Read the tiles of a mosaic dataset into a list of spatial images (sims).
     The function reads the data lazily and sets the tile positions from the metadata.
@@ -35,6 +35,8 @@ def read_mosaic_into_sims(filepath, scene_index=0):
         Path to the mosaic dataset.
     scene_index : int, optional
         Index of the scene to read. Default is 0.
+    view_index : int, optional
+        Index of the view to read. If None, will assume the tiles were already fused.
 
     Returns
     -------
@@ -45,7 +47,7 @@ def read_mosaic_into_sims(filepath, scene_index=0):
     filepath = Path(filepath)
 
     if filepath.suffix == ".czi":
-        return read_mosaic_into_sims_czifile(filepath, scene_index=scene_index)
+        return read_mosaic_into_sims_czifile(filepath, scene_index=scene_index, view_index=view_index)
 
     else:
         return read_mosaic_into_sims_aicsimageio(
@@ -165,7 +167,7 @@ def read_mosaic_into_sims_aicsimageio(path, scene_index=0):
     return view_sims
 
 
-def read_mosaic_into_sims_czifile(filename, scene_index=0):
+def read_mosaic_into_sims_czifile(filename, scene_index=0, view_index=None):
     """
     Read the tiles of a CZI mosaic dataset into a list of sims.
     This function uses czifile.py (instead of aicsimageio) to read the CZI file.
@@ -196,8 +198,8 @@ def read_mosaic_into_sims_czifile(filename, scene_index=0):
         spacing = si_utils.get_spacing_from_sim(xim)
 
         sim = si_utils.get_sim_from_array(
-            xim.data,
-            dims=xim.dims,
+            xim.data if view_index is None else xim.data[view_index],
+            dims=xim.dims if view_index is None else tuple(d for d in xim.dims if d != "i"),
             scale=spacing,
             translation=si_utils.get_origin_from_sim(xim),
             transform_key=METADATA_TRANSFORM_KEY,
