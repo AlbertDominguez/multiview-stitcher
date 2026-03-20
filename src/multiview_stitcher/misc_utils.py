@@ -61,7 +61,17 @@ def process_batch_using_ray(func, block_ids, num_cpus=4):
             num_cpus=num_cpus
         )
 
-    futures = [ray.remote(func).remote(block_id) for block_id in block_ids]
+    # Store func once in the object store so its serialized form is not
+    # sent with every task (avoids the "remote function is very large"
+    # warning and the associated memory pressure).  Works for plain
+    # functions, closures, and functools.partial objects alike.
+    func_ref = ray.put(func)
+
+    @ray.remote
+    def _call(func_ref, block_id):
+        func_ref(block_id)
+
+    futures = [_call.remote(func_ref, block_id) for block_id in block_ids]
     ray.get(futures)
 
     return

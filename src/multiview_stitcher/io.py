@@ -15,7 +15,7 @@ except ImportError:
     AICSImage = None
 
 
-from multiview_stitcher import czi_utils, lif_utils
+from multiview_stitcher import czi_utils, lif_utils, nd2_utils
 from multiview_stitcher import spatial_image_utils as si_utils
 
 METADATA_TRANSFORM_KEY = si_utils.DEFAULT_TRANSFORM_KEY
@@ -50,6 +50,9 @@ def read_mosaic_into_sims(filepath, scene_index=0):
     elif filepath.suffix == ".lif":
         return read_mosaic_into_sims_readlif(filepath, scene_index=scene_index)
 
+    elif filepath.suffix == ".nd2":
+        return read_mosaic_into_sims_nd2(filepath, scene_index=scene_index)
+
     else:
         return read_mosaic_into_sims_aicsimageio(
             filepath, scene_index=scene_index
@@ -75,6 +78,13 @@ def get_number_of_scenes_in_mosaic(filepath):
 
     if filepath.suffix == ".czi":
         return czi_utils.get_czi_shape(filepath)["S"]
+
+    elif filepath.suffix == ".lif":
+        return lif_utils.get_number_of_scenes(filepath)
+
+    elif filepath.suffix == ".nd2":
+        # ND2 currently maps to a single scene with P as tile index.
+        return 1
 
     else:
         if AICSImage is None:
@@ -221,6 +231,60 @@ def read_mosaic_into_sims_readlif(filepath, scene_index=0):
             t_coords=xim.coords["t"].values if "t" in xim.dims else None,
         )
 
+        sims.append(sim)
+
+    return sims
+
+
+def read_mosaic_into_sims_nd2(filepath, scene_index=0):
+    """
+    Read the tiles of an ND2 mosaic dataset into a list of sims.
+    This function uses nd2 (instead of aicsimageio) to read the ND2 file.
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to the ND2 file.
+    scene_index : int, optional
+        Scene index. ND2 currently supports scene_index=0 only.
+
+    Returns
+    -------
+    list of SpatialImage
+        One SpatialImage per mosaic tile / position.
+    """
+    filepath = Path(filepath)
+
+    xims = nd2_utils.read_nd2_into_xims(filepath, scene_index=scene_index)
+    spacing = nd2_utils.get_spacing_from_nd2(filepath)
+    tile_origins = nd2_utils.get_nd2_mosaic_origins(filepath, spacing)
+
+    sims = []
+    for ixim, xim in enumerate(xims):
+        spatial_dims = [dim for dim in xim.dims if dim in si_utils.SPATIAL_DIMS]
+
+        origin = (
+            tile_origins[ixim]
+            if ixim < len(tile_origins)
+            else dict.fromkeys(spatial_dims, 0.0)
+        )
+
+        xim = xim.assign_coords(
+            {
+                sdim: xim.coords[sdim].values - xim.coords[sdim].values[0]
+                for sdim in spatial_dims
+            }
+        )
+
+        sim = si_utils.get_sim_from_array(
+            xim.data,
+            dims=list(xim.dims),
+            scale=spacing,
+            translation=origin,
+            transform_key=METADATA_TRANSFORM_KEY,
+            c_coords=xim.coords["c"].values if "c" in xim.dims else None,
+            t_coords=xim.coords["t"].values if "t" in xim.dims else None,
+        )
         sims.append(sim)
 
     return sims

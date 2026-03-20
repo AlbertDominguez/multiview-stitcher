@@ -1389,12 +1389,11 @@ def compute_pairwise_registrations(
     # memory management is implemented. Ideally, registration methods
     # should report their memory usage and we can use this information
     # to annotate the dask graph.
-
-    if n_parallel_pairwise_regs is None:
-        ndim = msi_utils.get_ndim(msims[0])
-        if ndim == 3:
-            n_parallel_pairwise_regs = 1
-            logger.info("Setting n_parallel_pairwise_regs to 1 for 3D data")
+    # if n_parallel_pairwise_regs is None:
+    #     ndim = msi_utils.get_ndim(msims[0])
+    #     if ndim == 3:
+    #         n_parallel_pairwise_regs = 1
+    #         logger.info("Setting n_parallel_pairwise_regs to 1 for 3D data")
 
     # report on how many pairwise registrations are computed in parallel
     if n_parallel_pairwise_regs is None:

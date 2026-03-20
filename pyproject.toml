@@ -83,6 +83,9 @@ czi = [
 lif = [
     "readlif",
 ]
+nd2 = [
+    "nd2",
+]
 dev = [
     "tox",
     "jupyter",
@@ -93,6 +96,7 @@ dev = [
     "antspyx >=0.6.0",
     "czifile ==2019.7.2.3",
     "imagecodecs >=2023.7.10",
+    "nd2",
     "pre-commit",
 ]
 
