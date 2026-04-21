@@ -95,13 +95,16 @@ def get_nd2_mosaic_origins(filepath, spacing):
         if not points:
             return [default_origin.copy() for _ in range(n_pos)]
 
+        # Nikon ND2: stage-X axis is inverted relative to the image-X axis,
+        # so raw stagePositionUm.x gives tiles in reverse order along X.
+        # Negate X to bring stage coordinates into image space.
         origins = []
         for i_pos in range(n_pos):
             if i_pos < len(points):
                 point = points[i_pos]
                 origin = {
                     "y": float(point.stagePositionUm.y),
-                    "x": float(point.stagePositionUm.x),
+                    "x": -float(point.stagePositionUm.x),
                 }
                 if has_z:
                     origin["z"] = float(point.stagePositionUm.z)
