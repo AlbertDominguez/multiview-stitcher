@@ -26,6 +26,15 @@ from multiview_stitcher import (
 )
 from multiview_stitcher import spatial_image_utils as si_utils
 
+try:
+    import cupy as cp
+except ImportError:
+    cp = None
+
+import logging
+
+logger = logging.getLogger(__name__)
+
 BoundingBox = dict[str, dict[str, Union[float, int]]]
 
 
@@ -73,11 +82,11 @@ def weighted_average_fusion(
     """
 
     if fusion_weights is None:
+        # blending_weights are already normalized in fuse_np; skip redundant pass
         additive_weights = blending_weights
     else:
         additive_weights = blending_weights * fusion_weights
-
-    additive_weights = weights.normalize_weights(additive_weights)
+        additive_weights = weights.normalize_weights(additive_weights)
 
     product = transformed_views * additive_weights
 
@@ -142,13 +151,18 @@ def process_output_chunksize(sims, output_chunksize):
 
 def process_output_stack_properties(
     sims,
-    output_spacing,
-    output_origin,
-    output_shape,
-    output_stack_properties,
-    output_stack_mode,
-    transform_key,
+    output_spacing=None,
+    output_origin=None,
+    output_shape=None,
+    output_stack_properties=None,
+    output_stack_mode="union",
+    transform_key=None,
 ):
+    if transform_key is None:
+        raise ValueError(
+            "transform_key must be provided to determine transformation" \
+            "parameters for calculating output stack properties."
+        )
     
     params = [
         si_utils.get_affine_from_sim(sim, transform_key=transform_key)
@@ -179,7 +193,7 @@ def fuse(
     sims: list,
     transform_key: str = None,
     fusion_func: Callable = weighted_average_fusion,
-    fusion_method_kwargs: dict = None,
+    fusion_func_kwargs: dict = None,
     weights_func: Callable = None,
     weights_func_kwargs: dict = None,
     output_spacing: dict[str, float] = None,
@@ -213,11 +227,12 @@ def fuse(
         Fusion function to be applied. This function receives the following
         inputs (as arrays if applicable): transformed_views, blending_weights, fusion_weights, params.
         By default weighted_average_fusion
-    fusion_method_kwargs : dict, optional
+    fusion_func_kwargs : dict, optional
     weights_func : Callable, optional
-        Function to calculate fusion weights. This function receives the
-        following inputs: transformed_views (as spatial images), params.
-        It returns (non-normalized) fusion weights for each view.
+        Function to calculate fusion weights. This function always receives
+        transformed_views and may additionally receive params and
+        blending_weights when those parameters are declared in its
+        signature. It returns (non-normalized) fusion weights for each view.
         By default None.
     weights_func_kwargs : dict, optional
     output_spacing : dict, optional
@@ -276,19 +291,19 @@ def fuse(
         batch_func = batch_options.get("batch_func", None)
         n_batch = batch_options.get("n_batch", 1)
         batch_func_kwargs = batch_options.get("batch_func_kwargs", None)
-        zarr_array_creation_kwargs = batch_options.get("zarr_array_creation_kwargs", None)
 
         # Collect zarr options with defaults
         zarr_options = zarr_options or {}
         ome_zarr = zarr_options.get("ome_zarr", False)
         ngff_version = zarr_options.get("ngff_version", "0.4")
         overwrite = zarr_options.get("overwrite", True)
+        zarr_array_creation_kwargs = zarr_options.get("zarr_array_creation_kwargs", None)
 
         # Resolve store path for data (OME-Zarr stores scale 0 under "<root>/0")
         store_url = os.path.join(output_zarr_url, "0") if ome_zarr else output_zarr_url
 
-        if overwrite and os.path.exists(store_url):
-            shutil.rmtree(store_url)
+        if overwrite and os.path.exists(output_zarr_url):
+            shutil.rmtree(output_zarr_url)
         if ome_zarr:
             # Ensure creation kwargs reflect NGFF version when writing OME-Zarr
             zarr_array_creation_kwargs = ngff_utils.update_zarr_array_creation_kwargs_for_ngff_version(
@@ -300,7 +315,7 @@ def fuse(
             "sims": sims,
             "transform_key": transform_key,
             "fusion_func": fusion_func,
-            "fusion_method_kwargs": fusion_method_kwargs,
+            "fusion_func_kwargs": fusion_func_kwargs,
             "weights_func": weights_func,
             "weights_func_kwargs": weights_func_kwargs,
             "output_spacing": output_spacing,
@@ -324,7 +339,6 @@ def fuse(
         nblocks = block_fusion_info["nblocks"]
         osp = block_fusion_info["output_stack_properties"]
         osp["shape"] = {dim: int(v) for dim, v in osp["shape"].items()}
-
         print(f'Fusing {np.prod(nblocks)} blocks in batches of {n_batch}...')
         for batch in tqdm(
             misc_utils.ndindex_batches(nblocks, n_batch),
@@ -356,6 +370,8 @@ def fuse(
                 output_zarr_url=output_zarr_url,
                 overwrite=False,
                 batch_options=batch_options,
+                zarr_array_creation_kwargs=zarr_array_creation_kwargs,
+                ngff_version=ngff_version,
             )
 
         return fused
@@ -381,18 +397,30 @@ def fuse(
         for sim in sims
     ]
 
-    # determine overlap from weights method
-    # (soon: fusion methods will also require overlap)
-    overlap_in_pixels = 0
-    if weights_func is not None:
-        overlap_in_pixels = np.max(
-            [
-                overlap_in_pixels,
-                weights.calculate_required_overlap(
-                    weights_func, weights_func_kwargs
-                ),
-            ]
-        )
+    # determine overlap from weights/fusion methods and user-supplied value
+    overlap_in_pixels = overlap_in_pixels or 0
+    # normalize to dict[str, int]
+    if not isinstance(overlap_in_pixels, dict):
+        overlap_in_pixels = {dim: overlap_in_pixels for dim in sdims}
+    shrink_distance = 0
+    for func, func_kwargs in [
+        (weights_func, weights_func_kwargs),
+        (fusion_func, fusion_func_kwargs),
+    ]:
+        if func is not None and hasattr(func, "required_overlap"):
+            # Inject output_chunksize so the overlap can be clamped to it.
+            _kwargs_with_chunksize = dict(func_kwargs or {})
+            if has_keyword(func, "output_chunksize") and output_chunksize is not None:
+                _kwargs_with_chunksize.setdefault("output_chunksize", output_chunksize)
+            curr_overlap = func.required_overlap(_kwargs_with_chunksize)
+            # normalize
+            if not isinstance(curr_overlap, dict):
+                curr_overlap = {dim: curr_overlap for dim in sdims}
+            overlap_in_pixels = {
+                dim: max(overlap_in_pixels[dim], curr_overlap[dim]) for dim in sdims
+            }
+        if func is not None and hasattr(func, "required_source_shrinkage"):
+            shrink_distance = func.required_source_shrinkage(func_kwargs)
 
     # calculate output chunk bounding boxes
     output_chunk_bbs, block_indices = mv_graph.get_chunk_bbs(
@@ -405,13 +433,13 @@ def fuse(
         | {
             "origin": {
                 dim: output_chunk_bb["origin"][dim]
-                - overlap_in_pixels * output_stack_properties["spacing"][dim]
+                - overlap_in_pixels[dim] * output_stack_properties["spacing"][dim]
                 for dim in sdims
             }
         }
         | {
             "shape": {
-                dim: output_chunk_bb["shape"][dim] + 2 * overlap_in_pixels
+                dim: output_chunk_bb["shape"][dim] + 2 * overlap_in_pixels[dim]
                 for dim in sdims
             }
         }
@@ -467,6 +495,81 @@ def fuse(
                 continue
             fix_dims.append(dim)
 
+        # Pre-compute the inverse of each tile's affine transform once.
+        # This avoids recomputing np.linalg.inv inside get_overlap_for_bbs for
+        # every (tile, chunk) pair.
+        inv_sparams = [
+            xr.DataArray(
+                np.linalg.inv(sp.data),
+                dims=sp.dims,
+                coords=sp.coords,
+            )
+            for sp in sparams
+        ]
+
+        # Build a chunk_index -> [tile_indices] mapping by iterating over tiles
+        # and using the regular output chunk grid to find overlapping chunks via
+        # simple index arithmetic — O(N_tiles * ndim) instead of O(N_tiles * N_chunks).
+        #
+        # Output chunks form a regular grid: all blocks have the same pixel size
+        # per dimension except possibly the last block (which may be smaller).
+        # The first (uniform) block size is sufficient to map any physical
+        # coordinate to a chunk index via floor division; we clamp to the valid
+        # range so the last partial block is always included when needed.
+        _normalized_chunks = normalize_chunks(
+            [output_chunksize[dim] for dim in sdims],
+            [output_stack_properties["shape"][dim] for dim in sdims],
+        )
+        _n_blocks_per_dim = [len(c) for c in _normalized_chunks]
+        _uniform_cs_per_dim = [c[0] for c in _normalized_chunks]
+        _osp_origin = np.array(
+            [output_stack_properties["origin"][dim] for dim in sdims]
+        )
+        _osp_spacing = np.array(
+            [output_stack_properties["spacing"][dim] for dim in sdims]
+        )
+        # Physical padding: interpolation extent + chunk overlap added to output chunks
+        _additional_extent_pixels = np.array(
+            [0.0 if dim in fix_dims else float(interpolation_order) for dim in sdims]
+        )
+        _padding_phys = (
+            _additional_extent_pixels * _osp_spacing
+            + np.array([overlap_in_pixels[dim] for dim in sdims]) * _osp_spacing
+        )
+
+        _chunk_to_tiles: dict = {}
+        for iview in range(len(sims)):
+            # Forward-project tile corners through the affine to get its AABB
+            # in output (world) space.
+            tile_corners_output = transformation.transform_pts(
+                mv_graph.get_vertices_from_stack_props(views_bb[iview]),
+                sparams[iview].data,
+            )
+            aabb_min = np.min(tile_corners_output, axis=0) - _padding_phys
+            aabb_max = np.max(tile_corners_output, axis=0) + _padding_phys
+
+            # Map the padded AABB to a range of chunk indices per dimension.
+            idx_ranges = []
+            skip = False
+            for idim in range(len(sdims)):
+                cs_phys = _uniform_cs_per_dim[idim] * _osp_spacing[idim]
+                i_first = max(
+                    0,
+                    int(np.floor((aabb_min[idim] - _osp_origin[idim]) / cs_phys)),
+                )
+                i_last = min(
+                    _n_blocks_per_dim[idim] - 1,
+                    int(np.floor((aabb_max[idim] - _osp_origin[idim]) / cs_phys)),
+                )
+                if i_first > i_last:
+                    skip = True
+                    break
+                idx_ranges.append(range(i_first, i_last + 1))
+            if skip:
+                continue
+            for chunk_idx in product(*idx_ranges):
+                _chunk_to_tiles.setdefault(chunk_idx, []).append(iview)
+
         fused_output_chunks = np.empty(
             np.max(block_indices, 0) + 1, dtype=object
         )
@@ -474,20 +577,21 @@ def fuse(
         for output_chunk_bb, output_chunk_bb_with_overlap, block_index in zip(
             output_chunk_bbs, output_chunk_bbs_with_overlap, block_indices
         ):
-            # calculate relevant slices for each output chunk
-            # this is specific to each non spatial coordinate
-            views_overlap_bb = [
-                mv_graph.get_overlap_for_bbs(
+            # Look up candidate tiles via the pre-built mapping (O(1) per chunk).
+            candidate_view_indices = _chunk_to_tiles.get(tuple(block_index), [])
+
+            views_overlap_bb = [None] * len(sims)
+            for iview in candidate_view_indices:
+                views_overlap_bb[iview] = mv_graph.get_overlap_for_bbs(
                     target_bb=output_chunk_bb_with_overlap,
-                    query_bbs=[view_bb],
-                    param=sparams[iview],
+                    query_bbs=[views_bb[iview]],
+                    param=inv_sparams[iview],
                     additional_extent_in_pixels={
                         dim: 0 if dim in fix_dims else int(interpolation_order)
                         for dim in sdims
                     },
+                    param_is_inverse=True,
                 )[0]
-                for iview, view_bb in enumerate(views_bb)
-            ]
 
             # append to output
             relevant_view_indices = np.where(
@@ -577,13 +681,14 @@ def fuse(
                 params=tmp_params,
                 output_properties=output_chunk_bb_with_overlap,
                 fusion_func=fusion_func,
-                fusion_method_kwargs=fusion_method_kwargs,
+                fusion_func_kwargs=fusion_func_kwargs,
                 weights_func=weights_func,
                 weights_func_kwargs=weights_func_kwargs,
                 trim_overlap_in_pixels=overlap_in_pixels,
                 interpolation_order=1,
                 full_view_bbs=full_view_bbs,
                 blending_widths=blending_widths,
+                shrink_distance=shrink_distance,
             )
 
             fused_output_chunk = da.from_delayed(
@@ -648,7 +753,7 @@ def fuse_np(
     params: Sequence[xr.DataArray],
     output_properties: BoundingBox,
     fusion_func: Callable = weighted_average_fusion,
-    fusion_method_kwargs: dict = None,
+    fusion_func_kwargs: dict = None,
     weights_func: Callable = None,
     weights_func_kwargs: Callable = None,
     trim_overlap_in_pixels: int = 0,
@@ -657,6 +762,7 @@ def fuse_np(
     spacings: Sequence[dict[str, float]] = None,
     origins: Sequence[dict[str, float]] = None,
     blending_widths: dict[float] = None,
+    shrink_distance=0,
 ):
     """
     Fuse tiles from in-memory slices.
@@ -675,7 +781,7 @@ def fuse_np(
         _description_, by default None
     weights_func_kwargs : _type_, optional
         _description_, by default None
-    overlap_in_pixels : int, optional
+    overlap_in_pixels : int or dict, optional
         _description_, by default None
     interpolation_order : int, optional
         _description_, by default 1
@@ -701,6 +807,8 @@ def fuse_np(
     #             translation=origins[isim],
     #         )
 
+    input_is_cupy = cp is not None and isinstance(sims[0].data, cp.ndarray)
+
     if has_keyword(fusion_func, "blending_weights") or has_keyword(
         weights_func, "blending_weights"
     ):
@@ -708,20 +816,24 @@ def fuse_np(
     else:
         fusion_requires_blending_weights = False
 
-    if fusion_method_kwargs is None:
-        fusion_method_kwargs = {}
+    if fusion_func_kwargs is None:
+        fusion_func_kwargs = {}
+    else:
+        # copy to avoid mutating input dict across calls
+        fusion_func_kwargs = dict(fusion_func_kwargs)
 
     if weights_func_kwargs is None:
         weights_func_kwargs = {}
+    else:
+        # copy to avoid mutating input dict across calls
+        weights_func_kwargs = dict(weights_func_kwargs)
 
     input_dtype = sims[0].dtype
-    ndim = si_utils.get_ndim_from_sim(sims[0])
-    si_utils.get_spatial_dims_from_sim(sims[0])
 
     # Transform input views
     field_ims_t = [
         transformation.transform_sim(
-            sim.astype(float),
+            sim.astype(np.float32),
             np.linalg.inv(param),
             output_stack_properties=output_properties,
             order=interpolation_order,
@@ -729,7 +841,7 @@ def fuse_np(
         ).data
         for sim, param in zip(sims, params)
     ]
-    field_ims_t = np.array(field_ims_t)
+    field_ims_t = np.stack(field_ims_t)
 
     # get blending weights
     if fusion_requires_blending_weights:
@@ -739,43 +851,67 @@ def fuse_np(
                 source_bb=full_view_bbs[iview],
                 affine=params[iview],
                 blending_widths=blending_widths,
+                shrink_distance=shrink_distance,
+                cupy=input_is_cupy,
             )
             for iview in range(len(sims))
         ]
+        field_ws_t = np.stack(field_ws_t)
         field_ws_t = field_ws_t * ~np.isnan(field_ims_t)
         field_ws_t = weights.normalize_weights(field_ws_t)
     else:
         field_ws_t = None
 
-    fusion_method_kwargs["transformed_views"] = field_ims_t
+    fusion_func_kwargs["transformed_views"] = field_ims_t
     if has_keyword(fusion_func, "params"):
-        fusion_method_kwargs["params"] = params
+        fusion_func_kwargs["params"] = params
     if fusion_requires_blending_weights:
-        fusion_method_kwargs["blending_weights"] = field_ws_t
+        fusion_func_kwargs["blending_weights"] = field_ws_t
+    if has_keyword(fusion_func, "output_spacing") and "output_spacing" not in fusion_func_kwargs:
+        fusion_func_kwargs["output_spacing"] = output_properties["spacing"]
 
     # calculate fusion weights if required
     if weights_func is not None and has_keyword(fusion_func, "fusion_weights"):
         weights_func_kwargs["transformed_views"] = field_ims_t
         if has_keyword(weights_func, "params"):
             weights_func_kwargs["params"] = params
-        if fusion_requires_blending_weights:
+        if has_keyword(weights_func, "blending_weights"):
             weights_func_kwargs["blending_weights"] = field_ws_t
+        if has_keyword(weights_func, "output_chunksize") and "output_chunksize" not in weights_func_kwargs:
+            weights_func_kwargs["output_chunksize"] = output_properties["shape"]
 
         fusion_weights = weights_func(**weights_func_kwargs)
-        fusion_method_kwargs["fusion_weights"] = fusion_weights
+        fusion_func_kwargs["fusion_weights"] = fusion_weights
 
     fused = func_ignore_nan_warning(
         fusion_func,
-        **fusion_method_kwargs,
+        **fusion_func_kwargs,
     )
 
     # trim overlap
-    if trim_overlap_in_pixels > 0:
+    # normalize to dict[str, int]
+    if not isinstance(trim_overlap_in_pixels, dict):
+        trim_overlap_in_pixels = {
+            dim: trim_overlap_in_pixels for dim in output_properties["shape"].keys()
+        }
+
+    if any(trim_overlap_in_pixels[dim] > 0 for dim in output_properties["shape"].keys()):
         fused = fused[
-            (slice(trim_overlap_in_pixels, -trim_overlap_in_pixels),) * ndim
+            tuple([slice(trim_overlap_in_pixels[dim], -trim_overlap_in_pixels[dim])
+                   for dim in output_properties["shape"].keys()])
         ]
 
     fused = np.nan_to_num(fused).astype(input_dtype)
+
+    # delete references to intermediate arrays to free memory
+    del field_ims_t
+    if fusion_requires_blending_weights:
+        del field_ws_t
+    if weights_func is not None and has_keyword(fusion_func, "fusion_weights"):
+        del fusion_weights
+
+    del fusion_func_kwargs
+    del weights_func_kwargs
 
     return fused
 
@@ -1108,14 +1244,14 @@ def prepare_block_fusion(
          + [output_stack_properties['shape'][dim] for dim in sdims]
     full_output_chunksize = [1,] * len(nsdims)\
          + [int(output_chunksize[dim]) for dim in sdims]
-    
+        
     normalized_chunks = normalize_chunks(
         shape=full_output_shape,
         chunks=full_output_chunksize)
     
-    print(f"Fusing into a an output stack:")
+    print("Fusing into an output stack:")
     print("- shape: ", {dim: int(output_stack_properties['shape'][dim])
-        if dim in sdims else 1 for dim in dims})
+        if dim in sdims else ns_shape[dim] for dim in dims})
     print("- spacing: ", {k: float(v)
         for k, v in output_stack_properties['spacing'].items()})
     print("- origin: ", {k: float(v)
@@ -1163,16 +1299,34 @@ def prepare_block_fusion(
         chunk_shape = {sdims[idim]: normalized_chunks[len(nsdims) + idim][b]
                     for idim, b in enumerate(spatial_chunk_ind)}
 
+
+        sims = fuse_kwargs.get("sims")
+        # restrict sims to relevant non-spatial coordinates
+        sims = [si_utils.sim_sel_coords(
+            sim,
+            {dim: sim.coords[dim][[ic]] for dim, ic in ns_coord.items()})
+            for sim in sims]
+
+        logger.debug(
+            "Fusing chunk with block id %s, spatial chunk index %s",
+            block_id,
+            spatial_chunk_ind,
+        )
         fused = fuse(
-            sims=fuse_kwargs.get("sims"),
+            sims=sims,
             **{k: v for k, v in fuse_kwargs.items() if k != "sims"},
             output_origin={dim: chunk_offset_phys[dim] for dim in sdims},
             output_shape={dim: chunk_shape[dim] for dim in sdims},
             output_spacing={dim: osp['spacing'][dim] for dim in sdims},
             ).data
 
-        fused = fused[tuple(slice(ns_coord[dim], ns_coord[dim] + 1) for dim in nsdims)]
+        input_is_cupy = cp is not None and isinstance(fused, cp.ndarray)
 
+        if cp is not None:
+            fused = fused.map_blocks(
+                lambda x: cp.asnumpy(x) if isinstance(x, cp.ndarray) else x)
+
+        # Write the fused chunk to the appropriate location in the Zarr array
         with dask_config.set(scheduler='single-threaded'):
             da.to_zarr(
                 fused, output_zarr_array,
@@ -1180,6 +1334,9 @@ def prepare_block_fusion(
                     [slice(ns_coord[dim], ns_coord[dim] + 1) for dim in nsdims] +
                     [slice(chunk_offset[dim], chunk_offset[dim] + chunk_shape[dim]) for dim in sdims]),
             )
+
+        if cp is not None:
+            misc_utils.clear_cupy_memory()
 
         return
     

@@ -79,6 +79,7 @@ for tile_array, tile_translation in zip(tile_arrays, tile_translations):
         dims=["c", "z", "y", "x"],
         scale=spacing,
         translation=tile_translation,
+        # affine=None, # (e.g. for rotated or sheared tiles)
         transform_key="stage_metadata",
         c_coords=channels,
     )
@@ -137,7 +138,7 @@ For large datasets (>50GB, potentially with benefits already at >5GB) consider s
 
 
 ```python
-from multiview_stitcher import fusion, misc_utils
+from multiview_stitcher import fusion
 
 fused = fusion.fuse(
     sims=[msi_utils.get_sim_from_msim(msim) for msim in msims],
@@ -148,12 +149,12 @@ fused = fusion.fuse(
         "ome_zarr": True,
         # "ngff_version": "0.4",  # optional
     },
-    # optionally, we can use ray for parallelization (`pip install "ray[default]"`)
+    # optionally, we can use joblib for parallelization (`pip install joblib` and `from multiview_stitcher import misc_utils`):
     # batch_options={
-    #     "batch_func": misc_utils.process_batch_using_ray,
-    #     "n_batch": 4,  # number of chunk fusions to schedule / submit at a time
+    #     "batch_func": misc_utils.process_batch_using_joblib,
+    #     "n_batch": 20,  # number of chunk fusions to schedule / submit at a time
     #     "batch_func_kwargs": {
-    #         'num_cpus': 4  # number of processes for parallel processing to use with ray
+    #         'n_jobs': 4  # number of parallel jobs for joblib
     #     },
     # },
 )
@@ -240,7 +241,7 @@ The table below is a **high-level orientation** (features and workflows often ov
 | --- | --- | --- | :--: | :--: | --- | :--: | --- |
 | BigStitcher | Fiji | GUI-driven multi-view + tiled microscopy workflows | ✅ | ✅ | rigid + affine | ✅ | ImageJ macros / batch |
 | Ashlar | Python | multiplexed whole-slide 2D mosaics | ✅ | — | translation/rigid mosaics | limited* | CLI + Python |
-| TeraStitcher | C++ | very large tiled 3D volumes | ✅ | ✅ | translation/rigid | ✅ | CLI |
+| TeraStitcher | C++ | very large tiled 3D volumes | — | ✅ | translation/rigid | ✅ | CLI |
 | multiview-stitcher | Python | modular registration + fusion integrated into Python workflows | ✅ | ✅ | rigid + affine | ✅ | Jupyter notebooks / Python API + napari / neuroglancer |
 
 \* “Out-of-core / huge data” depends heavily on workflow, file formats, and output options. Several tools here can handle very large datasets; in practice, Python can make it particularly convenient to compose and distribute stitching workflows across compute resources.

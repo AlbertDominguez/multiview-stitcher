@@ -20,6 +20,7 @@ from multiview_stitcher import (
     msi_utils,
     mv_graph,
     ngff_utils,
+    param_utils,
     spatial_image_utils,
 )
 
@@ -283,34 +284,18 @@ def plot_positions(
 
 def plot_stack_props(stack_props, ax, color="black", size=10, linewidth=1):
     ndim = mv_graph.get_ndim_from_stack_props(stack_props)
-    faces = mv_graph.get_faces_from_stack_props(stack_props)
+    vertices = mv_graph.get_vertices_from_stack_props(stack_props)
 
-    # get line segments
-    line_segments = []
-
-    if ndim == 3:
-        for face in faces:
-            inds = np.argsort(np.linalg.norm(face[1:] - face[0], axis=-1))
-            line_segments.append([face[0], face[inds[0] + 1]])
-            line_segments.append([face[0], face[inds[1] + 1]])
-            line_segments.append(
-                [
-                    face[inds[0] + 1],
-                    face[inds[0] + 1] + face[inds[1] + 1] - face[0],
-                ]
-            )
-            line_segments.append(
-                [
-                    face[inds[1] + 1],
-                    face[inds[1] + 1] + face[inds[0] + 1] - face[0],
-                ]
-            )
-
-    elif ndim == 2:
-        for face in faces:
-            line_segments.append([face[0], face[1]])
-
-    line_segments = np.array(line_segments)
+    # Build box edges by topology (index hypercube), then map to transformed
+    # vertex coordinates. This is robust for arbitrary affine transforms.
+    gv = np.array(list(np.ndindex(tuple([2] * ndim))))
+    edge_pairs = [
+        (i, j)
+        for i in range(len(gv))
+        for j in range(i + 1, len(gv))
+        if np.sum(np.abs(gv[i] - gv[j])) == 1
+    ]
+    line_segments = np.array([[vertices[i], vertices[j]] for i, j in edge_pairs])
 
     if ndim == 2:
         line_segments = np.concatenate(
@@ -322,6 +307,342 @@ def plot_stack_props(stack_props, ax, color="black", size=10, linewidth=1):
     )
 
     ax.add_collection3d(line_collection)
+
+
+def plot_tile_pair_image_metrics(
+    msims,
+    reg_metrics_result,
+    base_transform_key,
+    query_transform_keys,
+    metric_key=None,
+    clims=None,
+    show_bboxes=True,
+    show_overview_plot=False,
+    overview_pair_linewidth=1.0,
+    show_plot_positions=True,
+):
+    """
+    Visualise registration quality metrics for each query transform key.
+
+    For every entry in *query_transform_keys* a separate figure is produced.
+    Each figure shows the tile layout **in that query transform key's world
+    coordinate space** and overlays either the pairwise comparison bounding
+    boxes (when *show_bboxes* is ``True``) or a minimalistic graph where edges
+    are coloured by the metric value (when *show_bboxes* is ``False``).
+
+    The comparison bboxes, which are originally defined in *base_transform_key*
+    world space, are projected into each query key's world space via
+    ``T_fixed_q @ inv(T_fixed_base)`` (applied to the fixed tile of each pair)
+    before being drawn.
+
+    All figures share the same colorbar limits, derived by default from the
+    *base_transform_key* metric values when it is included as a query key,
+    so all other query keys are compared against the same reference scale.
+
+    Parameters
+    ----------
+    msims : list of MultiscaleSpatialImage
+        The input views, passed unchanged to :func:`plot_positions`.
+    reg_metrics_result : dict
+        The dictionary returned by :func:`multiview_stitcher.metrics.tile_pair_image_metrics`.
+        Must contain the ``"pairs"`` and ``"bboxes"`` keys.
+    base_transform_key : str
+        Transform key used to define the original comparison bboxes and to set
+        colorbar limits when it appears in *query_transform_keys*.
+    query_transform_keys : str or list of str
+        Subset of transform keys to visualise.  Each key must appear in
+        *reg_metrics_result["pairs"]*.  Tile positions and comparison bboxes
+        are shown in each key's own world coordinate space.
+    metric_key : str, optional
+        Name of the metric to use for colouring the comparison boxes or edges.
+        Defaults to the first metric key found in the result.
+    clims : tuple of (float, float), optional
+        Explicit ``(vmin, vmax)`` for the shared colorbar.  When ``None``
+        (default) the limits are computed from *base_transform_key* values
+        if that key is present in the result, falling back to all query-key
+        values otherwise.
+    show_bboxes : bool, optional
+        When ``True`` (default) the comparison bounding boxes are drawn and
+        coloured by metric value.  When ``False`` a minimalistic
+        :func:`plot_positions` plot is produced instead, where edges between
+        adjacent tiles are coloured by the (mean of the two directed)
+        metric values.
+    show_overview_plot : bool, optional
+        When ``True``, produce one additional figure showing a paired plot
+        with *query_transform_keys* on the x-axis and the metric value on the
+        y-axis for each pair.  A mean ± std summary (black diamond + error
+        bar) is overlaid for each transform key.  By default ``False``.
+    overview_pair_linewidth : float, optional
+        Line width for the per-pair lines in the overview plot.  Set to
+        ``0`` to suppress the lines entirely and show only the mean ± std
+        summary markers.  By default ``1.0``.
+    show_plot_positions : bool, optional
+        When ``True`` (default) the per-query-key positional plots (tile
+        layout with coloured comparison bboxes or coloured edges) are
+        produced.  Set to ``False`` to skip them, e.g. when only the
+        overview plot is needed.
+
+    Returns
+    -------
+    dict[str, tuple[matplotlib.figure.Figure, matplotlib.axes.Axes]]
+        Maps each query transform key to its ``(fig, ax)`` pair.
+    """
+    if isinstance(query_transform_keys, str):
+        query_transform_keys = [query_transform_keys]
+
+    pairs_dict = reg_metrics_result["pairs"]
+    bboxes_dict = reg_metrics_result.get("bboxes", {})
+
+    sims = [msi_utils.get_sim_from_msim(msim) for msim in msims]
+    spatial_dims = spatial_image_utils.get_spatial_dims_from_sim(sims[0])
+
+    # Collect all available metric keys from the result
+    available_metric_keys = set()
+    for q_metrics in pairs_dict.values():
+        for m in q_metrics.values():
+            available_metric_keys.update(m.keys())
+
+    # Determine which metric to colour by
+    if metric_key is None:
+        metric_key = sorted(available_metric_keys)[0] if available_metric_keys else None
+    elif metric_key not in available_metric_keys:
+        raise ValueError(
+            f"metric_key {metric_key!r} not found in metrics result. "
+            f"Available metric keys: {sorted(available_metric_keys)}"
+        )
+
+    # Resolve colorbar limits
+    if clims is not None:
+        vmin, vmax = float(clims[0]), float(clims[1])
+    else:
+        ref_keys = (
+            [base_transform_key]
+            if base_transform_key in query_transform_keys
+            else query_transform_keys
+        )
+        ref_values = []
+        for pair_metrics in pairs_dict.values():
+            for q in ref_keys:
+                val = pair_metrics.get(q, {}).get(metric_key, np.nan)
+                try:
+                    val_f = float(val)
+                except (TypeError, ValueError):
+                    val_f = np.nan
+                if not np.isnan(val_f):
+                    ref_values.append(val_f)
+
+        if len(ref_values) >= 2 and min(ref_values) < max(ref_values):
+            vmin, vmax = min(ref_values), max(ref_values)
+        elif ref_values:
+            vmin = ref_values[0] - 0.5
+            vmax = ref_values[0] + 0.5
+        else:
+            vmin, vmax = 0.0, 1.0
+
+    norm = colors.Normalize(vmin=vmin, vmax=vmax)
+    cmap = colormaps.get_cmap("Spectral")
+
+    # Build the list of undirected edges (averaged over both directions) once,
+    # used only when show_bboxes=False.
+    if not show_bboxes:
+        seen = {}
+        for (fi, mi) in pairs_dict:
+            key = tuple(sorted((fi, mi)))
+            if key not in seen:
+                seen[key] = []
+            seen[key].append((fi, mi))
+        undirected_edges = list(seen.keys())
+
+    plots = {}
+    for q in query_transform_keys:
+        if not show_plot_positions:
+            continue
+        if show_bboxes:
+            fig, ax = plot_positions(
+                msims,
+                transform_key=q,
+                use_positional_colors=False,
+                show_plot=False,
+                plot_title=f"{metric_key}  |  transform key: {q}",
+            )
+
+            for (fi, mi), bbox in bboxes_dict.items():
+                if bbox is None:
+                    continue
+
+                val = pairs_dict.get((fi, mi), {}).get(q, {}).get(metric_key, np.nan)
+                try:
+                    val_f = float(val)
+                except (TypeError, ValueError):
+                    val_f = np.nan
+
+                color = (
+                    cmap(norm(val_f)) if not np.isnan(val_f) else (0.5, 0.5, 0.5, 1.0)
+                )
+
+                lower = bbox["lower"]
+                upper = bbox["upper"]
+
+                # Project the bbox from base_transform_key world space into
+                # query key world space using the fixed tile's transforms:
+                # T_fixed_q @ inv(T_fixed_base) maps a base-world point to
+                # query-world, so bbox corners are visualised at the correct
+                # location for each query key.
+                T_fixed_base = (
+                    spatial_image_utils.get_affine_from_sim(sims[fi], base_transform_key)
+                    .squeeze()
+                    .data
+                )
+                T_fixed_q = (
+                    spatial_image_utils.get_affine_from_sim(sims[fi], q)
+                    .squeeze()
+                    .data
+                )
+                bbox_transform = T_fixed_q# @ np.linalg.inv(T_fixed_base)
+
+                sp = {
+                    "origin": {
+                        dim: float(lower[idim])
+                        for idim, dim in enumerate(spatial_dims)
+                    },
+                    "spacing": {
+                        dim: float(upper[idim] - lower[idim])
+                        for idim, dim in enumerate(spatial_dims)
+                    },
+                    "shape": {dim: 2 for dim in spatial_dims},
+                    "transform": param_utils.affine_to_xaffine(bbox_transform),
+                }
+                plot_stack_props(sp, ax, color=color, linewidth=2)
+
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([])
+            plt.colorbar(sm, ax=ax, label=metric_key)
+
+        else:
+            # Minimalistic mode: colour edges by mean metric value over both
+            # directed pairs.
+            edge_color_vals = []
+            for fi, mi in undirected_edges:
+                directed = seen[(fi, mi)]
+                vals = [
+                    float(pairs_dict.get(d, {}).get(q, {}).get(metric_key, np.nan))
+                    for d in directed
+                ]
+                valid = [v for v in vals if not np.isnan(v)]
+                edge_color_vals.append(float(np.mean(valid)) if valid else np.nan)
+
+            fig, ax = plot_positions(
+                msims,
+                transform_key=q,
+                use_positional_colors=False,
+                edges=undirected_edges,
+                edge_color_vals=edge_color_vals,
+                edge_cmap=cmap,
+                edge_clims=[vmin, vmax],
+                edge_label=metric_key,
+                show_plot=False,
+                plot_title=f"{metric_key}  |  transform key: {q}",
+            )
+
+        plt.show()
+
+        plots[q] = (fig, ax)
+
+    # ------------------------------------------------------------------
+    # Overview plots: one figure per metric key
+    # ------------------------------------------------------------------
+    if show_overview_plot:
+        n_keys = len(query_transform_keys)
+        x_positions = list(range(n_keys))
+
+        for mk in [metric_key]:
+            fig_ov, ax_ov = plt.subplots(figsize=(max(3.5, 1.6 * n_keys + 1.2), 3.8))
+
+            # Collect per-pair values across query keys
+            pair_keys = list(pairs_dict.keys())
+            all_vals_flat = []
+            pair_series = []
+            for pair in pair_keys:
+                y_vals = []
+                for q in query_transform_keys:
+                    raw = pairs_dict[pair].get(q, {}).get(mk, np.nan)
+                    try:
+                        y_vals.append(float(raw))
+                    except (TypeError, ValueError):
+                        y_vals.append(np.nan)
+                pair_series.append(y_vals)
+                all_vals_flat.extend([v for v in y_vals if not np.isnan(v)])
+
+            # Per-pair lines
+            if overview_pair_linewidth > 0:
+                for y_vals in pair_series:
+                    if any(not np.isnan(v) for v in y_vals):
+                        ax_ov.plot(
+                            x_positions,
+                            y_vals,
+                            color="#9e9e9e",
+                            alpha=0.55,
+                            linewidth=overview_pair_linewidth,
+                            marker="o",
+                            markersize=3.5,
+                            zorder=2,
+                        )
+
+            # Mean ± std summary per transform key
+            means, stds = [], []
+            for ix, q in enumerate(query_transform_keys):
+                vals = [
+                    float(pairs_dict[pair].get(q, {}).get(mk, np.nan))
+                    for pair in pair_keys
+                ]
+                vals = [v for v in vals if not np.isnan(v)]
+                if vals:
+                    mean_v = float(np.mean(vals))
+                    std_v = float(np.std(vals))
+                    means.append(mean_v)
+                    stds.append(std_v)
+                    ax_ov.errorbar(
+                        ix,
+                        mean_v,
+                        yerr=std_v,
+                        fmt="o",
+                        color="#1f77b4",
+                        markersize=8,
+                        linewidth=2,
+                        capsize=5,
+                        capthick=2,
+                        zorder=4,
+                    )
+
+            # Connect the mean points with a line for easy trend reading
+            valid_x = [ix for ix, q in enumerate(query_transform_keys)
+                       if any(not np.isnan(float(pairs_dict[pair].get(q, {}).get(mk, np.nan)))
+                              for pair in pair_keys)]
+            if len(valid_x) > 1:
+                mean_y = []
+                for ix in valid_x:
+                    q = query_transform_keys[ix]
+                    vals = [float(pairs_dict[pair].get(q, {}).get(mk, np.nan))
+                            for pair in pair_keys]
+                    vals = [v for v in vals if not np.isnan(v)]
+                    mean_y.append(float(np.mean(vals)) if vals else np.nan)
+                ax_ov.plot(valid_x, mean_y, color="#1f77b4", linewidth=1.5,
+                           zorder=3, alpha=0.8)
+
+            ax_ov.set_xticks(x_positions)
+            ax_ov.set_xticklabels(query_transform_keys, rotation=20, ha="right",
+                                  fontsize=10)
+            ax_ov.set_ylabel(mk, fontsize=11)
+            ax_ov.set_xlim(-0.5, n_keys - 0.5)
+            ax_ov.spines["top"].set_visible(False)
+            ax_ov.spines["right"].set_visible(False)
+            ax_ov.tick_params(axis="both", labelsize=9)
+            ax_ov.grid(axis="y", color="#e0e0e0", linewidth=0.8, zorder=0)
+            plt.tight_layout()
+
+            plt.show()
+
+    return plots
 
 
 def serve_dir(dir_path, port=8000):
@@ -458,6 +779,27 @@ def get_contrast_min_max_from_ome_zarr_omero_metadata(
     return np.array([window["start"], window["end"]])
 
 
+def _affine_to_neuroglancer_source_transform(
+    affine, sdims, output_spacing
+):
+    """
+    Convert a physical-space affine to a Neuroglancer source transform.
+
+    OME-Zarr scale and translation already map pixel coordinates into the
+    source coordinate space. Neuroglancer rescales source-transform linear
+    coefficients from input to output dimension scales internally, but its
+    translation coefficients are expressed directly in output coordinate units.
+    """
+    affine = np.array(affine, dtype=float, copy=True)
+    affine_ndim = affine.shape[-1] - 1
+    affine_sdims = sdims[-affine_ndim:]
+    output_spacing_array = np.array(
+        [output_spacing[dim] for dim in affine_sdims]
+    )
+    affine[:-1, -1] = affine[:-1, -1] / output_spacing_array
+    return affine
+
+
 def generate_neuroglancer_json(
     ome_zarr_paths: list[str],
     ome_zarr_urls: list[str],
@@ -483,22 +825,28 @@ def generate_neuroglancer_json(
             )
 
         full_affines = [np.eye(len(dims) + 1) for _ in sims]
+        spacings_per_sim = []
         for isim, sim in enumerate(sims):
-            sim_spacing = spatial_image_utils.get_spacing_from_sim(sim)
+
+            sim_ome_zarr = ngff_utils.read_sim_from_ome_zarr(ome_zarr_paths[isim])
+            spacing_isim = spatial_image_utils.get_spacing_from_sim(sim_ome_zarr)
+            spacings_per_sim.append(spacing_isim)
+
             affine = spatial_image_utils.get_affine_from_sim(
                 sim, transform_key=transform_key
             )
             if "t" in affine.dims:
                 affine = affine.sel(t=0)
-            affine = np.array(affine)
-            affine_ndim = affine.shape[-1] - 1
-            # https://github.com/google/neuroglancer/issues/538
-            affine[:-1, -1] = affine[:-1, -1] / np.array(
-                [sim_spacing[dim] for dim in sdims]
+            affine = _affine_to_neuroglancer_source_transform(
+                affine,
+                sdims=sdims,
+                output_spacing=spacing_isim,
             )
+            affine_ndim = affine.shape[-1] - 1
             full_affines[isim][-affine_ndim - 1 :, -affine_ndim - 1 :] = affine
     else:
         full_affines = [None for _ in ome_zarr_paths]
+        spacings_per_sim = [spacing] * len(ome_zarr_paths)
 
     if contrast_limits is not None:
         window = {
@@ -570,8 +918,11 @@ def generate_neuroglancer_json(
                             list(row) for row in full_affines[iview][:-1]
                         ],
                         "outputDimensions": {
-                            (dim if dim != "c" else "c'"): d
-                            for dim, d in output_dimensions.items()
+                            (dim if dim != "c" else "c'"): [
+                                spacings_per_sim[iview][dim] * 1e-6 if dim in sdims else 1e-6,
+                                "",
+                            ]
+                            for dim in dims
                         },
                     }
                     if full_affines[iview] is not None
@@ -613,8 +964,11 @@ def generate_neuroglancer_json(
                                 list(row) for row in full_affines[iview][:-1]
                             ],
                             "outputDimensions": {
-                                (dim if dim != "c" else "c'"): d
-                                for dim, d in output_dimensions.items()
+                                (dim if dim != "c" else "c'"): [
+                                    spacings_per_sim[iview][dim] * 1e-6 if dim in sdims else 1e-6,
+                                    "",
+                                ]
+                                for dim in dims
                             },
                         },
                     }
@@ -689,7 +1043,7 @@ def view_neuroglancer(
 
     Parameters
     ----------
-    ome_zarr_paths : list of str
+    ome_zarr_paths : list of str or Path
         path to OME-Zarrs
     sims : list of spatial_images, optional
     transform_key : str, optional
@@ -705,10 +1059,47 @@ def view_neuroglancer(
         from the OME-Zarr omero metadata if available, by default None
     """
 
+    ome_zarr_paths = [str(p) for p in ome_zarr_paths]
+
+    # determine a common root for all local paths so files in different
+    # directories can all be served from a single HTTP server
+    _MAX_SERVE_DEPTH = 3
+    local_paths = [p for p in ome_zarr_paths if not p.startswith("http")]
+    if local_paths:
+        dir_to_serve = os.path.commonpath(
+            [os.path.dirname(os.path.abspath(p)) for p in local_paths]
+        )
+        # safety check: refuse to serve overly broad directories
+        for path in local_paths:
+            rel = os.path.relpath(os.path.abspath(path), dir_to_serve)
+            depth = len(rel.split(os.sep))
+            if dir_to_serve == os.sep or depth > _MAX_SERVE_DEPTH:
+                import warnings
+
+                warnings.warn(
+                    f"view_neuroglancer: the common ancestor directory "
+                    f"'{dir_to_serve}' is too broad (depth {depth} > "
+                    f"{_MAX_SERVE_DEPTH}) or is the filesystem root. "
+                    f"Local files will not be served. "
+                    f"Pass HTTP URLs instead.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                dir_to_serve = None
+                break
+    else:
+        dir_to_serve = None
+
     # generate urls for the ome zarr files
+    # use forward slashes in URLs regardless of OS path separator
     ome_zarr_urls = [
-        f"http://localhost:{port}/{os.path.basename(path)}"
-        if not path.startswith("http")
+        "http://localhost:{port}/{rel}".format(
+            port=port,
+            rel=os.path.relpath(os.path.abspath(path), dir_to_serve).replace(
+                os.sep, "/"
+            ),
+        )
+        if (not path.startswith("http") and dir_to_serve is not None)
         else path
         for path in ome_zarr_paths
     ]
@@ -726,6 +1117,9 @@ def view_neuroglancer(
     )
     ng_url = get_neuroglancer_url(ng_json)
 
+    print("Neuroglancer configuration JSON:")
+    print(ng_json)
+
     print("Opening Neuroglancer in browser...")
     print("URL:", ng_url)
     print("Controls:")
@@ -741,12 +1135,5 @@ def view_neuroglancer(
     webbrowser.open(ng_url)
 
     # serve the local ome-zarr files
-    local = False
-    for path in ome_zarr_paths:
-        if not path.startswith("http"):
-            dir_to_serve = os.path.dirname(path)
-            local = True
-            break
-
-    if local:
+    if dir_to_serve is not None:
         serve_dir(dir_to_serve, port=port)
